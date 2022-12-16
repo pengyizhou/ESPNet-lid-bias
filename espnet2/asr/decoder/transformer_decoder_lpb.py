@@ -11,8 +11,12 @@ from espnet2.asr.decoder.abs_decoder import AbsDecoder
 from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
 from espnet.nets.pytorch_backend.transformer.attention import MultiHeadedAttention
 from espnet.nets.pytorch_backend.transformer.decoder_layer import DecoderLayer
+from espnet.nets.pytorch_backend.transformer.dynamic_conv import DynamicConvolution
+from espnet.nets.pytorch_backend.transformer.dynamic_conv2d import DynamicConvolution2D
 from espnet.nets.pytorch_backend.transformer.embedding import PositionalEncoding
 from espnet.nets.pytorch_backend.transformer.layer_norm import LayerNorm
+from espnet.nets.pytorch_backend.transformer.lightconv import LightweightConvolution
+from espnet.nets.pytorch_backend.transformer.lightconv2d import LightweightConvolution2D
 from espnet.nets.pytorch_backend.transformer.mask import subsequent_mask
 from espnet.nets.pytorch_backend.transformer.positionwise_feed_forward import (
     PositionwiseFeedForward,
@@ -54,11 +58,13 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         use_output_layer: bool = True,
         pos_enc_class=PositionalEncoding,
         normalize_before: bool = True,
+        lid_weight: float = 0.8,
     ):
         assert check_argument_types()
         super().__init__()
         attention_dim = encoder_output_size
         attn_append_dim = attention_dim + lid_vocab_size
+        self.lid_weight = lid_weight
         self.lid_vocab_size = lid_vocab_size
 
         if input_layer == "embed":
@@ -73,6 +79,7 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         else:
             raise ValueError(f"only 'embed' is supported: {input_layer}")
         
+        self.pos_proj = torch.nn.Linear(attn_append_dim, attention_dim)
         self.after_norm = LayerNorm(attention_dim)
         self.after_norm_lid = LayerNorm(attention_dim)
         self.output_layer = torch.nn.Linear(attention_dim, vocab_size)
@@ -81,8 +88,6 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         # Must set by the inheritance
         self.decoders = None
         self.lid_decoders = None
-        self.gating_net = torch.nn.Linear(attention_dim, lid_vocab_size)
-        self.proj_enc = torch.nn.Linear(attn_append_dim, attention_dim)
 
     def forward(
         self,
@@ -117,33 +122,39 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         tgt_mask = tgt_mask & m
 
         memory = hs_pad
-        memory_mask = (~make_pad_mask(hlens, maxlen=memory.size(1)))[:, None, :].to(
-            memory.device
+        memory_lid = memory.clone()
+        memory_mask = (~make_pad_mask(hlens, maxlen=memory_lid.size(1)))[:, None, :].to(
+            memory_lid.device
         )
         # Padding for Longformer
-        if memory_mask.shape[-1] != memory.shape[1]:
-            padlen = memory.shape[1] - memory_mask.shape[-1]
+        if memory_mask.shape[-1] != memory_lid.shape[1]:
+            padlen = memory_lid.shape[1] - memory_lid.shape[-1]
             memory_mask = torch.nn.functional.pad(
                 memory_mask, (0, padlen), "constant", False
             )
 
-        memory_lid = memory.clone()
+        
         x_lid = self.embed_lid(tgt)
         x_lid, tgt_mask_lid, memory_lid, memory_mask_lid = self.lid_decoders(x_lid, tgt_mask, memory_lid, memory_mask)
         x_lid = self.after_norm_lid(x_lid)
         x_lid = self.output_lid_layer(x_lid)
-        lid_post_enc = torch.nn.functional.softmax(self.gating_net(memory_lid.detach().clone()), dim=-1)
+        lid_post = torch.nn.functional.softmax(x_lid, dim=-1)
+
+
+        sos_lid = torch.zeros((lid_post.size(0),1 , self.lid_vocab_size))
+        sos_lid[:,:,-1] = 1.0
+        sos_lid = sos_lid.type_as(lid_post)
+        lid_post = torch.concat((sos_lid, lid_post[:,:-1,:]),dim=1)
+
         x = self.embed(tgt)
-        memory = torch.concat((lid_post_enc, memory),dim=-1)
-        memory = self.proj_enc(memory)
-        
-        # memory = self.normalize_enc(memory)
-        x, tgt_mask, memory_, memory_mask = self.decoders(x, tgt_mask, memory, memory_mask)
+        x = torch.cat((lid_post, x), dim=-1)
+        x = self.pos_proj(x)
+        x, tgt_mask, memory, memory_mask = self.decoders(x, tgt_mask, memory, memory_mask)
         x = self.after_norm(x)
         x = self.output_layer(x)
 
         olens = tgt_mask.sum(1)
-        return x, x_lid, memory
+        return x, x_lid, olens
 
     def forward_one_step(
         self,
@@ -177,14 +188,17 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
 
         x_lid = self.after_norm_lid(x_lid)
         x_lid = self.output_lid_layer(x_lid)
+        lid_post = torch.nn.functional.softmax(x_lid, dim=-1)
 
-        lid_post_enc = torch.nn.functional.softmax(self.gating_net(memory_lid), dim=-1)
+        sos_lid = torch.zeros((lid_post.size(0),1 , self.lid_vocab_size))
+        sos_lid[:,:,-1] = 1.0
+        sos_lid = sos_lid.type_as(lid_post)
+        lid_post = torch.concat((sos_lid, lid_post[:,:-1,:]),dim=1)
+
 
         x = self.embed(tgt)
-        
-        memory = torch.concat((lid_post_enc, memory),dim=-1)
-        memory = self.proj_enc(memory)
-        # memory = self.normalize_enc(memory)
+        x = torch.cat((lid_post, x), dim=-1)
+        x = self.pos_proj(x)
         if cache is None:
             cache = [None] * len(self.decoders)
         new_cache = []
@@ -199,7 +213,7 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
 
         return y, new_cache
 
-    def score(self, ys, state, x):
+    def score(self, ys, state, x, lid_post):
         """Score."""
         ys_mask = subsequent_mask(len(ys), device=x.device).unsqueeze(0)
         logp, state = self.forward_one_step(
@@ -263,6 +277,7 @@ class TransformerDecoder(BaseTransformerDecoder):
         pos_enc_class=PositionalEncoding,
         normalize_before: bool = True,
         concat_after: bool = False,
+        lid_weight: float = 0.8,
     ):
         assert check_argument_types()
         super().__init__(
@@ -275,6 +290,7 @@ class TransformerDecoder(BaseTransformerDecoder):
             use_output_layer=use_output_layer,
             pos_enc_class=pos_enc_class,
             normalize_before=normalize_before,
+            lid_weight=lid_weight,
         )
 
         attention_dim = encoder_output_size

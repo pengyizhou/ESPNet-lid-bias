@@ -81,8 +81,6 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         # Must set by the inheritance
         self.decoders = None
         self.lid_decoders = None
-        self.gating_net = torch.nn.Linear(attention_dim, lid_vocab_size)
-        self.proj_enc = torch.nn.Linear(attn_append_dim, attention_dim)
 
     def forward(
         self,
@@ -132,18 +130,15 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         x_lid, tgt_mask_lid, memory_lid, memory_mask_lid = self.lid_decoders(x_lid, tgt_mask, memory_lid, memory_mask)
         x_lid = self.after_norm_lid(x_lid)
         x_lid = self.output_lid_layer(x_lid)
-        lid_post_enc = torch.nn.functional.softmax(self.gating_net(memory_lid.detach().clone()), dim=-1)
+
         x = self.embed(tgt)
-        memory = torch.concat((lid_post_enc, memory),dim=-1)
-        memory = self.proj_enc(memory)
-        
         # memory = self.normalize_enc(memory)
-        x, tgt_mask, memory_, memory_mask = self.decoders(x, tgt_mask, memory, memory_mask)
+        x, tgt_mask, memory, memory_mask = self.decoders(x, tgt_mask, memory, memory_mask)
         x = self.after_norm(x)
         x = self.output_layer(x)
 
         olens = tgt_mask.sum(1)
-        return x, x_lid, memory
+        return x, x_lid, olens
 
     def forward_one_step(
         self,
@@ -165,25 +160,8 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
             y, cache: NN output value and cache per `self.decoders`.
             y.shape` is (batch, maxlen_out, token)
         """
-        x_lid = self.embed_lid(tgt)
-        cache_lid = cache
-        if cache is None:
-            cache_lid = [None] * len(self.lid_decoders)
-        memory_lid = memory.clone()
-        for c, decoder in zip(cache_lid, self.lid_decoders):
-            x_lid, tgt_mask, memory_lid, memory_mask_lid = decoder(
-                x_lid, tgt_mask, memory_lid, None, cache=c
-            )
-
-        x_lid = self.after_norm_lid(x_lid)
-        x_lid = self.output_lid_layer(x_lid)
-
-        lid_post_enc = torch.nn.functional.softmax(self.gating_net(memory_lid), dim=-1)
 
         x = self.embed(tgt)
-        
-        memory = torch.concat((lid_post_enc, memory),dim=-1)
-        memory = self.proj_enc(memory)
         # memory = self.normalize_enc(memory)
         if cache is None:
             cache = [None] * len(self.decoders)

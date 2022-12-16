@@ -73,6 +73,8 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         else:
             raise ValueError(f"only 'embed' is supported: {input_layer}")
         
+        self.pos_proj = torch.nn.Linear(attn_append_dim, attention_dim)
+        # self.normalize_enc = LayerNorm(attention_dim)
         self.after_norm = LayerNorm(attention_dim)
         self.after_norm_lid = LayerNorm(attention_dim)
         self.output_layer = torch.nn.Linear(attention_dim, vocab_size)
@@ -82,7 +84,7 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         self.decoders = None
         self.lid_decoders = None
         self.gating_net = torch.nn.Linear(attention_dim, lid_vocab_size)
-        self.proj_enc = torch.nn.Linear(attn_append_dim, attention_dim)
+        self.proj_enc = torch.nn.Linear(attention_dim+lid_vocab_size, attention_dim)
 
     def forward(
         self,
@@ -133,17 +135,28 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         x_lid = self.after_norm_lid(x_lid)
         x_lid = self.output_lid_layer(x_lid)
         lid_post_enc = torch.nn.functional.softmax(self.gating_net(memory_lid.detach().clone()), dim=-1)
+        lid_post = torch.nn.functional.softmax(x_lid, dim=-1)
+
+
+        sos_lid = torch.zeros((lid_post.size(0),1 , self.lid_vocab_size))
+        sos_lid[:,:,-1] = 1.0
+        sos_lid = sos_lid.type_as(lid_post)
+        lid_post = torch.concat((sos_lid, lid_post[:,:-1,:]),dim=1)
+
+
         x = self.embed(tgt)
+        x = torch.cat((lid_post, x), dim=-1)
+        x = self.pos_proj(x)
         memory = torch.concat((lid_post_enc, memory),dim=-1)
         memory = self.proj_enc(memory)
         
         # memory = self.normalize_enc(memory)
-        x, tgt_mask, memory_, memory_mask = self.decoders(x, tgt_mask, memory, memory_mask)
+        x, tgt_mask, memory, memory_mask = self.decoders(x, tgt_mask, memory, memory_mask)
         x = self.after_norm(x)
         x = self.output_layer(x)
 
         olens = tgt_mask.sum(1)
-        return x, x_lid, memory
+        return x, x_lid, olens
 
     def forward_one_step(
         self,
@@ -177,10 +190,18 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
 
         x_lid = self.after_norm_lid(x_lid)
         x_lid = self.output_lid_layer(x_lid)
-
+        lid_post = torch.nn.functional.softmax(x_lid, dim=-1)
         lid_post_enc = torch.nn.functional.softmax(self.gating_net(memory_lid), dim=-1)
 
+        sos_lid = torch.zeros((lid_post.size(0),1 , self.lid_vocab_size))
+        sos_lid[:,:,-1] = 1.0
+        sos_lid = sos_lid.type_as(lid_post)
+        lid_post = torch.concat((sos_lid, lid_post[:,:-1,:]),dim=1)
+
+
         x = self.embed(tgt)
+        x = torch.cat((lid_post, x), dim=-1)
+        x = self.pos_proj(x)
         
         memory = torch.concat((lid_post_enc, memory),dim=-1)
         memory = self.proj_enc(memory)
@@ -199,7 +220,7 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
 
         return y, new_cache
 
-    def score(self, ys, state, x):
+    def score(self, ys, state, x, lid_post):
         """Score."""
         ys_mask = subsequent_mask(len(ys), device=x.device).unsqueeze(0)
         logp, state = self.forward_one_step(

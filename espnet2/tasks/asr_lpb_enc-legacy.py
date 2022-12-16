@@ -9,12 +9,7 @@ from typeguard import check_argument_types, check_return_type
 
 from espnet2.asr.ctc import CTC
 from espnet2.asr.decoder.abs_decoder import AbsDecoder
-from espnet2.asr.decoder.transformer_decoder_language import TransformerDecoder as LID
-from espnet2.asr.decoder.transformer_decoder_asr_gate import TransformerDecoder as ASR_Gate
-from espnet2.asr.decoder.transformer_decoder_lpb import TransformerDecoder as LPB
 from espnet2.asr.decoder.transformer_decoder_gating import TransformerDecoder as Gate
-from espnet2.asr.decoder.transformer_decoder_lpb_enc import TransformerDecoder as LPB_Enc
-from espnet2.asr.decoder.transformer_decoder_lpb_gating import TransformerDecoder as LPB_Gate
 
 from espnet2.asr.encoder.abs_encoder import AbsEncoder
 from espnet2.asr.encoder.conformer_encoder import ConformerEncoder
@@ -144,12 +139,7 @@ postencoder_choices = ClassChoices(
 decoder_choices = ClassChoices(
     "decoder",
     classes=dict(
-        transformersum=LPB_Enc,
-        transformerlpb=LPB,
-        transformergate=LPB_Gate,
         gate=Gate,
-        lid=LID,
-        asrgate=ASR_Gate,
     ),
     type_check=AbsDecoder,
     default="rnn",

@@ -55,6 +55,7 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         positional_dropout_rate: float = 0.1,
         input_layer: str = "embed",
         use_output_layer: bool = True,
+        hidden_layer_idx: List[int] = [],
         pos_enc_class=PositionalEncoding,
         normalize_before: bool = True,
     ):
@@ -81,11 +82,16 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         self.normalize_before = normalize_before
         if self.normalize_before:
             self.after_norm = LayerNorm(attention_dim)
+
         if use_output_layer:
             self.output_layer = torch.nn.Linear(attention_dim, vocab_size)
         else:
             self.output_layer = None
-
+        
+        self.hidden_layer_idx = hidden_layer_idx
+        if len(self.hidden_layer_idx) > 0:
+            self.emb_norm = LayerNorm(vocab_size)
+            self.hidden_output_layer = torch.nn.Linear(attention_dim, vocab_size)
         # Must set by the inheritance
         self.decoders = None
 
@@ -133,14 +139,34 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
             )
 
         x = self.embed(tgt)
-        x, tgt_mask, memory, memory_mask = self.decoders(
-            x, tgt_mask, memory, memory_mask)
+
+        intermediate_outs = []
+        if len(self.hidden_layer_idx) == 0:
+            x, tgt_mask, memory, memory_mask = self.decoders(
+                x, tgt_mask, memory, memory_mask)
+        else:
+            for layer_idx, decoder_layer in enumerate(self.decoders):
+                x, tgt_mask, memory, memory_mask = decoder_layer(
+                    x, tgt_mask, memory, memory_mask)
+
+                if layer_idx + 1 in self.hidden_layer_idx:
+                    decoder_out = x
+                    if isinstance(decoder_out, tuple):
+                        decoder_out = decoder_out[0]
+                    decoder_out = torch.tanh(self.hidden_output_layer(decoder_out))
+                    decoder_out = self.emb_norm(decoder_out)
+                    intermediate_outs.append((layer_idx + 1, decoder_out))
+
         if self.normalize_before:
             x = self.after_norm(x)
         if self.output_layer is not None:
             x = self.output_layer(x)
 
         olens = tgt_mask.sum(1)
+
+        if len(intermediate_outs) > 0:
+            return (x, intermediate_outs), olens
+
         return x, olens
 
     def forward_one_step(
@@ -242,6 +268,7 @@ class TransformerDecoder(BaseTransformerDecoder):
         src_attention_dropout_rate: float = 0.0,
         input_layer: str = "embed",
         use_output_layer: bool = True,
+        hidden_layer_idx: List[int] = [],
         pos_enc_class=PositionalEncoding,
         normalize_before: bool = True,
         concat_after: bool = False,
@@ -253,6 +280,7 @@ class TransformerDecoder(BaseTransformerDecoder):
             dropout_rate=dropout_rate,
             positional_dropout_rate=positional_dropout_rate,
             input_layer=input_layer,
+            hidden_layer_idx=hidden_layer_idx,
             use_output_layer=use_output_layer,
             pos_enc_class=pos_enc_class,
             normalize_before=normalize_before,

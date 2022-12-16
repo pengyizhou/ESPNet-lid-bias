@@ -11,12 +11,8 @@ from espnet2.asr.decoder.abs_decoder import AbsDecoder
 from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
 from espnet.nets.pytorch_backend.transformer.attention import MultiHeadedAttention
 from espnet.nets.pytorch_backend.transformer.decoder_layer import DecoderLayer
-from espnet.nets.pytorch_backend.transformer.dynamic_conv import DynamicConvolution
-from espnet.nets.pytorch_backend.transformer.dynamic_conv2d import DynamicConvolution2D
 from espnet.nets.pytorch_backend.transformer.embedding import PositionalEncoding
 from espnet.nets.pytorch_backend.transformer.layer_norm import LayerNorm
-from espnet.nets.pytorch_backend.transformer.lightconv import LightweightConvolution
-from espnet.nets.pytorch_backend.transformer.lightconv2d import LightweightConvolution2D
 from espnet.nets.pytorch_backend.transformer.mask import subsequent_mask
 from espnet.nets.pytorch_backend.transformer.positionwise_feed_forward import (
     PositionwiseFeedForward,
@@ -50,11 +46,13 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
     def __init__(
         self,
         vocab_size: int,
+        lid_vocab_size: int,
         encoder_output_size: int,
         dropout_rate: float = 0.1,
         positional_dropout_rate: float = 0.1,
         input_layer: str = "embed",
         use_output_layer: bool = True,
+        hidden_layer_idx: List[int] = [],
         pos_enc_class=PositionalEncoding,
         normalize_before: bool = True,
     ):
@@ -81,11 +79,12 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         self.normalize_before = normalize_before
         if self.normalize_before:
             self.after_norm = LayerNorm(attention_dim)
+
         if use_output_layer:
-            self.output_layer = torch.nn.Linear(attention_dim, vocab_size)
+            self.output_layer = torch.nn.Linear(attention_dim, lid_vocab_size)
         else:
             self.output_layer = None
-
+        
         # Must set by the inheritance
         self.decoders = None
 
@@ -133,14 +132,16 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
             )
 
         x = self.embed(tgt)
-        x, tgt_mask, memory, memory_mask = self.decoders(
-            x, tgt_mask, memory, memory_mask)
+
+        x, tgt_mask, memory, memory_mask = self.decoders(x, tgt_mask, memory, memory_mask)
+
         if self.normalize_before:
             x = self.after_norm(x)
         if self.output_layer is not None:
             x = self.output_layer(x)
 
         olens = tgt_mask.sum(1)
+
         return x, olens
 
     def forward_one_step(
@@ -232,6 +233,7 @@ class TransformerDecoder(BaseTransformerDecoder):
     def __init__(
         self,
         vocab_size: int,
+        lid_vocab_size: int,
         encoder_output_size: int,
         attention_heads: int = 4,
         linear_units: int = 2048,
@@ -242,6 +244,7 @@ class TransformerDecoder(BaseTransformerDecoder):
         src_attention_dropout_rate: float = 0.0,
         input_layer: str = "embed",
         use_output_layer: bool = True,
+        hidden_layer_idx: List[int] = [],
         pos_enc_class=PositionalEncoding,
         normalize_before: bool = True,
         concat_after: bool = False,
@@ -249,10 +252,12 @@ class TransformerDecoder(BaseTransformerDecoder):
         assert check_argument_types()
         super().__init__(
             vocab_size=vocab_size,
+            lid_vocab_size=lid_vocab_size,
             encoder_output_size=encoder_output_size,
             dropout_rate=dropout_rate,
             positional_dropout_rate=positional_dropout_rate,
             input_layer=input_layer,
+            hidden_layer_idx=hidden_layer_idx,
             use_output_layer=use_output_layer,
             pos_enc_class=pos_enc_class,
             normalize_before=normalize_before,
@@ -276,250 +281,3 @@ class TransformerDecoder(BaseTransformerDecoder):
             ),
         )
 
-
-class LightweightConvolutionTransformerDecoder(BaseTransformerDecoder):
-    def __init__(
-        self,
-        vocab_size: int,
-        encoder_output_size: int,
-        attention_heads: int = 4,
-        linear_units: int = 2048,
-        num_blocks: int = 6,
-        dropout_rate: float = 0.1,
-        positional_dropout_rate: float = 0.1,
-        self_attention_dropout_rate: float = 0.0,
-        src_attention_dropout_rate: float = 0.0,
-        input_layer: str = "embed",
-        use_output_layer: bool = True,
-        pos_enc_class=PositionalEncoding,
-        normalize_before: bool = True,
-        concat_after: bool = False,
-        conv_wshare: int = 4,
-        conv_kernel_length: Sequence[int] = (11, 11, 11, 11, 11, 11),
-        conv_usebias: int = False,
-    ):
-        assert check_argument_types()
-        if len(conv_kernel_length) != num_blocks:
-            raise ValueError(
-                "conv_kernel_length must have equal number of values to num_blocks: "
-                f"{len(conv_kernel_length)} != {num_blocks}"
-            )
-        super().__init__(
-            vocab_size=vocab_size,
-            encoder_output_size=encoder_output_size,
-            dropout_rate=dropout_rate,
-            positional_dropout_rate=positional_dropout_rate,
-            input_layer=input_layer,
-            use_output_layer=use_output_layer,
-            pos_enc_class=pos_enc_class,
-            normalize_before=normalize_before,
-        )
-
-        attention_dim = encoder_output_size
-        self.decoders = repeat(
-            num_blocks,
-            lambda lnum: DecoderLayer(
-                attention_dim,
-                LightweightConvolution(
-                    wshare=conv_wshare,
-                    n_feat=attention_dim,
-                    dropout_rate=self_attention_dropout_rate,
-                    kernel_size=conv_kernel_length[lnum],
-                    use_kernel_mask=True,
-                    use_bias=conv_usebias,
-                ),
-                MultiHeadedAttention(
-                    attention_heads, attention_dim, src_attention_dropout_rate
-                ),
-                PositionwiseFeedForward(attention_dim, linear_units, dropout_rate),
-                dropout_rate,
-                normalize_before,
-                concat_after,
-            ),
-        )
-
-
-class LightweightConvolution2DTransformerDecoder(BaseTransformerDecoder):
-    def __init__(
-        self,
-        vocab_size: int,
-        encoder_output_size: int,
-        attention_heads: int = 4,
-        linear_units: int = 2048,
-        num_blocks: int = 6,
-        dropout_rate: float = 0.1,
-        positional_dropout_rate: float = 0.1,
-        self_attention_dropout_rate: float = 0.0,
-        src_attention_dropout_rate: float = 0.0,
-        input_layer: str = "embed",
-        use_output_layer: bool = True,
-        pos_enc_class=PositionalEncoding,
-        normalize_before: bool = True,
-        concat_after: bool = False,
-        conv_wshare: int = 4,
-        conv_kernel_length: Sequence[int] = (11, 11, 11, 11, 11, 11),
-        conv_usebias: int = False,
-    ):
-        assert check_argument_types()
-        if len(conv_kernel_length) != num_blocks:
-            raise ValueError(
-                "conv_kernel_length must have equal number of values to num_blocks: "
-                f"{len(conv_kernel_length)} != {num_blocks}"
-            )
-        super().__init__(
-            vocab_size=vocab_size,
-            encoder_output_size=encoder_output_size,
-            dropout_rate=dropout_rate,
-            positional_dropout_rate=positional_dropout_rate,
-            input_layer=input_layer,
-            use_output_layer=use_output_layer,
-            pos_enc_class=pos_enc_class,
-            normalize_before=normalize_before,
-        )
-
-        attention_dim = encoder_output_size
-        self.decoders = repeat(
-            num_blocks,
-            lambda lnum: DecoderLayer(
-                attention_dim,
-                LightweightConvolution2D(
-                    wshare=conv_wshare,
-                    n_feat=attention_dim,
-                    dropout_rate=self_attention_dropout_rate,
-                    kernel_size=conv_kernel_length[lnum],
-                    use_kernel_mask=True,
-                    use_bias=conv_usebias,
-                ),
-                MultiHeadedAttention(
-                    attention_heads, attention_dim, src_attention_dropout_rate
-                ),
-                PositionwiseFeedForward(attention_dim, linear_units, dropout_rate),
-                dropout_rate,
-                normalize_before,
-                concat_after,
-            ),
-        )
-
-
-class DynamicConvolutionTransformerDecoder(BaseTransformerDecoder):
-    def __init__(
-        self,
-        vocab_size: int,
-        encoder_output_size: int,
-        attention_heads: int = 4,
-        linear_units: int = 2048,
-        num_blocks: int = 6,
-        dropout_rate: float = 0.1,
-        positional_dropout_rate: float = 0.1,
-        self_attention_dropout_rate: float = 0.0,
-        src_attention_dropout_rate: float = 0.0,
-        input_layer: str = "embed",
-        use_output_layer: bool = True,
-        pos_enc_class=PositionalEncoding,
-        normalize_before: bool = True,
-        concat_after: bool = False,
-        conv_wshare: int = 4,
-        conv_kernel_length: Sequence[int] = (11, 11, 11, 11, 11, 11),
-        conv_usebias: int = False,
-    ):
-        assert check_argument_types()
-        if len(conv_kernel_length) != num_blocks:
-            raise ValueError(
-                "conv_kernel_length must have equal number of values to num_blocks: "
-                f"{len(conv_kernel_length)} != {num_blocks}"
-            )
-        super().__init__(
-            vocab_size=vocab_size,
-            encoder_output_size=encoder_output_size,
-            dropout_rate=dropout_rate,
-            positional_dropout_rate=positional_dropout_rate,
-            input_layer=input_layer,
-            use_output_layer=use_output_layer,
-            pos_enc_class=pos_enc_class,
-            normalize_before=normalize_before,
-        )
-        attention_dim = encoder_output_size
-
-        self.decoders = repeat(
-            num_blocks,
-            lambda lnum: DecoderLayer(
-                attention_dim,
-                DynamicConvolution(
-                    wshare=conv_wshare,
-                    n_feat=attention_dim,
-                    dropout_rate=self_attention_dropout_rate,
-                    kernel_size=conv_kernel_length[lnum],
-                    use_kernel_mask=True,
-                    use_bias=conv_usebias,
-                ),
-                MultiHeadedAttention(
-                    attention_heads, attention_dim, src_attention_dropout_rate
-                ),
-                PositionwiseFeedForward(attention_dim, linear_units, dropout_rate),
-                dropout_rate,
-                normalize_before,
-                concat_after,
-            ),
-        )
-
-
-class DynamicConvolution2DTransformerDecoder(BaseTransformerDecoder):
-    def __init__(
-        self,
-        vocab_size: int,
-        encoder_output_size: int,
-        attention_heads: int = 4,
-        linear_units: int = 2048,
-        num_blocks: int = 6,
-        dropout_rate: float = 0.1,
-        positional_dropout_rate: float = 0.1,
-        self_attention_dropout_rate: float = 0.0,
-        src_attention_dropout_rate: float = 0.0,
-        input_layer: str = "embed",
-        use_output_layer: bool = True,
-        pos_enc_class=PositionalEncoding,
-        normalize_before: bool = True,
-        concat_after: bool = False,
-        conv_wshare: int = 4,
-        conv_kernel_length: Sequence[int] = (11, 11, 11, 11, 11, 11),
-        conv_usebias: int = False,
-    ):
-        assert check_argument_types()
-        if len(conv_kernel_length) != num_blocks:
-            raise ValueError(
-                "conv_kernel_length must have equal number of values to num_blocks: "
-                f"{len(conv_kernel_length)} != {num_blocks}"
-            )
-        super().__init__(
-            vocab_size=vocab_size,
-            encoder_output_size=encoder_output_size,
-            dropout_rate=dropout_rate,
-            positional_dropout_rate=positional_dropout_rate,
-            input_layer=input_layer,
-            use_output_layer=use_output_layer,
-            pos_enc_class=pos_enc_class,
-            normalize_before=normalize_before,
-        )
-        attention_dim = encoder_output_size
-
-        self.decoders = repeat(
-            num_blocks,
-            lambda lnum: DecoderLayer(
-                attention_dim,
-                DynamicConvolution2D(
-                    wshare=conv_wshare,
-                    n_feat=attention_dim,
-                    dropout_rate=self_attention_dropout_rate,
-                    kernel_size=conv_kernel_length[lnum],
-                    use_kernel_mask=True,
-                    use_bias=conv_usebias,
-                ),
-                MultiHeadedAttention(
-                    attention_heads, attention_dim, src_attention_dropout_rate
-                ),
-                PositionwiseFeedForward(attention_dim, linear_units, dropout_rate),
-                dropout_rate,
-                normalize_before,
-                concat_after,
-            ),
-        )

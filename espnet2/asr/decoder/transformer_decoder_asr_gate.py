@@ -81,8 +81,6 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         # Must set by the inheritance
         self.decoders = None
         self.lid_decoders = None
-        self.gating_net = torch.nn.Linear(attention_dim, lid_vocab_size)
-        self.proj_enc = torch.nn.Linear(attn_append_dim, attention_dim)
 
     def forward(
         self,
@@ -132,18 +130,23 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         x_lid, tgt_mask_lid, memory_lid, memory_mask_lid = self.lid_decoders(x_lid, tgt_mask, memory_lid, memory_mask)
         x_lid = self.after_norm_lid(x_lid)
         x_lid = self.output_lid_layer(x_lid)
-        lid_post_enc = torch.nn.functional.softmax(self.gating_net(memory_lid.detach().clone()), dim=-1)
+
+        lid_post = torch.log_softmax(x_lid, dim=-1).detach().clone()
+
         x = self.embed(tgt)
-        memory = torch.concat((lid_post_enc, memory),dim=-1)
-        memory = self.proj_enc(memory)
-        
         # memory = self.normalize_enc(memory)
-        x, tgt_mask, memory_, memory_mask = self.decoders(x, tgt_mask, memory, memory_mask)
+        x, tgt_mask, memory, memory_mask = self.decoders(x, tgt_mask, memory, memory_mask)
         x = self.after_norm(x)
         x = self.output_layer(x)
+        # print(f"x size: {x.size()}")
+        # print(f"x_lid size: {x_lid.size()}")
+        x[:, :, 0:2627] = x[:, :, 0:2627] + lid_post[:, :, 1].unsqueeze(-1)
+        x[:, :, 2627:5627] = x[:, :, 2627:5627] + lid_post[:, :, 0].unsqueeze(-1)
+        x[:, :, 5627] = x[:, :, 5627] + torch.maximum(lid_post[:, :, 0], lid_post[:, :, 1])
 
         olens = tgt_mask.sum(1)
-        return x, x_lid, memory
+        
+        return x, x_lid, olens
 
     def forward_one_step(
         self,
@@ -174,16 +177,11 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
             x_lid, tgt_mask, memory_lid, memory_mask_lid = decoder(
                 x_lid, tgt_mask, memory_lid, None, cache=c
             )
-
-        x_lid = self.after_norm_lid(x_lid)
+        x_lid = self.after_norm_lid(x_lid[:, -1])
         x_lid = self.output_lid_layer(x_lid)
-
-        lid_post_enc = torch.nn.functional.softmax(self.gating_net(memory_lid), dim=-1)
+        lid_post = torch.log_softmax(x_lid, dim=-1).detach().clone()
 
         x = self.embed(tgt)
-        
-        memory = torch.concat((lid_post_enc, memory),dim=-1)
-        memory = self.proj_enc(memory)
         # memory = self.normalize_enc(memory)
         if cache is None:
             cache = [None] * len(self.decoders)
@@ -195,7 +193,17 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
             new_cache.append(x)
 
         y = self.after_norm(x[:, -1])
-        y = torch.log_softmax(self.output_layer(y), dim=-1)
+        y = self.output_layer(y)
+        print(y[:, 0:2627].size())
+        print(lid_post[:, 1].size())
+        print(lid_post.size())
+        batch_size = y.size(0)
+        y[:, 0:2627] = y[:, 0:2627].view(batch_size, 2627) + lid_post[:, 1].unsqueeze(-1)
+        y[:, 2627:5627] = y[:, 2627:5627].view(batch_size, 3000) + lid_post[:, 0].unsqueeze(-1)
+        y[:, 5627] = y[ :, 5627] + torch.maximum(lid_post[:, 0], lid_post[:, 1])
+
+        
+        y = torch.log_softmax(y, dim=-1)
 
         return y, new_cache
 

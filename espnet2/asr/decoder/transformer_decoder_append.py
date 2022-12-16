@@ -1,7 +1,3 @@
-# Copyright 2019 Shigeki Karita
-#  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
-
-"""Decoder definition."""
 from typing import Any, List, Sequence, Tuple
 
 import torch
@@ -23,7 +19,6 @@ from espnet.nets.scorer_interface import BatchScorerInterface
 
 class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
     """Base class of Transfomer decoder module.
-
     Args:
         vocab_size: output dim
         encoder_output_size: dimension of attention
@@ -59,30 +54,27 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         super().__init__()
         attention_dim = encoder_output_size
         attn_append_dim = attention_dim + lid_vocab_size
-        self.lid_vocab_size = lid_vocab_size
 
         if input_layer == "embed":
             self.embed = torch.nn.Sequential(
                 torch.nn.Embedding(vocab_size, attention_dim),
                 pos_enc_class(attention_dim, positional_dropout_rate),
             )
-            self.embed_lid = torch.nn.Sequential(
-                torch.nn.Embedding(vocab_size, attention_dim),
-                pos_enc_class(attention_dim, positional_dropout_rate),
-            )
         else:
             raise ValueError(f"only 'embed' is supported: {input_layer}")
         
-        self.after_norm = LayerNorm(attention_dim)
-        self.after_norm_lid = LayerNorm(attention_dim)
-        self.output_layer = torch.nn.Linear(attention_dim, vocab_size)
-        self.output_lid_layer = torch.nn.Linear(attention_dim, lid_vocab_size)
+        self.pos_proj = torch.nn.Linear(attn_append_dim, attention_dim)
+
+        self.normalize_before = normalize_before
+        if self.normalize_before:
+            self.after_norm = LayerNorm(attention_dim)
+        if use_output_layer:
+            self.output_layer = torch.nn.Linear(attention_dim, vocab_size)
+        else:
+            self.output_layer = None
 
         # Must set by the inheritance
         self.decoders = None
-        self.lid_decoders = None
-        self.gating_net = torch.nn.Linear(attention_dim, lid_vocab_size)
-        self.proj_enc = torch.nn.Linear(attn_append_dim, attention_dim)
 
     def forward(
         self,
@@ -90,9 +82,9 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         hlens: torch.Tensor,
         ys_in_pad: torch.Tensor,
         ys_in_lens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        lid_post: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward decoder.
-
         Args:
             hs_pad: encoded memory, float32  (batch, maxlen_in, feat)
             hlens: (batch)
@@ -103,7 +95,6 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
             ys_in_lens: (batch)
         Returns:
             (tuple): tuple containing:
-
             x: decoded token score before softmax (batch, maxlen_out, token)
                 if use_output_layer is True,
             olens: (batch, )
@@ -127,33 +118,27 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
                 memory_mask, (0, padlen), "constant", False
             )
 
-        memory_lid = memory.clone()
-        x_lid = self.embed_lid(tgt)
-        x_lid, tgt_mask_lid, memory_lid, memory_mask_lid = self.lid_decoders(x_lid, tgt_mask, memory_lid, memory_mask)
-        x_lid = self.after_norm_lid(x_lid)
-        x_lid = self.output_lid_layer(x_lid)
-        lid_post_enc = torch.nn.functional.softmax(self.gating_net(memory_lid.detach().clone()), dim=-1)
         x = self.embed(tgt)
-        memory = torch.concat((lid_post_enc, memory),dim=-1)
-        memory = self.proj_enc(memory)
-        
-        # memory = self.normalize_enc(memory)
-        x, tgt_mask, memory_, memory_mask = self.decoders(x, tgt_mask, memory, memory_mask)
-        x = self.after_norm(x)
-        x = self.output_layer(x)
+        x = torch.cat((lid_post, x), dim=-1)
+        x = self.pos_proj(x)
+        x, tgt_mask, memory, memory_mask = self.decoders(x, tgt_mask, memory, memory_mask)
+        if self.normalize_before:
+            x = self.after_norm(x)
+        if self.output_layer is not None:
+            x = self.output_layer(x)
 
         olens = tgt_mask.sum(1)
-        return x, x_lid, memory
+        return x, olens
 
     def forward_one_step(
         self,
         tgt: torch.Tensor,
         tgt_mask: torch.Tensor,
         memory: torch.Tensor,
+        lid_post: torch.Tensor,
         cache: List[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """Forward one step.
-
         Args:
             tgt: input token ids, int64 (batch, maxlen_out)
             tgt_mask: input token mask,  (batch, maxlen_out)
@@ -165,26 +150,9 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
             y, cache: NN output value and cache per `self.decoders`.
             y.shape` is (batch, maxlen_out, token)
         """
-        x_lid = self.embed_lid(tgt)
-        cache_lid = cache
-        if cache is None:
-            cache_lid = [None] * len(self.lid_decoders)
-        memory_lid = memory.clone()
-        for c, decoder in zip(cache_lid, self.lid_decoders):
-            x_lid, tgt_mask, memory_lid, memory_mask_lid = decoder(
-                x_lid, tgt_mask, memory_lid, None, cache=c
-            )
-
-        x_lid = self.after_norm_lid(x_lid)
-        x_lid = self.output_lid_layer(x_lid)
-
-        lid_post_enc = torch.nn.functional.softmax(self.gating_net(memory_lid), dim=-1)
-
         x = self.embed(tgt)
-        
-        memory = torch.concat((lid_post_enc, memory),dim=-1)
-        memory = self.proj_enc(memory)
-        # memory = self.normalize_enc(memory)
+        x = torch.cat((lid_post, x), dim=-1)
+        x = self.pos_proj(x)
         if cache is None:
             cache = [None] * len(self.decoders)
         new_cache = []
@@ -194,35 +162,36 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
             )
             new_cache.append(x)
 
-        y = self.after_norm(x[:, -1])
-        y = torch.log_softmax(self.output_layer(y), dim=-1)
+        if self.normalize_before:
+            y = self.after_norm(x[:, -1])
+        else:
+            y = x[:, -1]
+        if self.output_layer is not None:
+            y = torch.log_softmax(self.output_layer(y), dim=-1)
 
         return y, new_cache
 
-    def score(self, ys, state, x):
+    def score(self, ys, state, x, lid_post):
         """Score."""
         ys_mask = subsequent_mask(len(ys), device=x.device).unsqueeze(0)
         logp, state = self.forward_one_step(
-            ys.unsqueeze(0), ys_mask, x.unsqueeze(0), cache=state
+            ys.unsqueeze(0), ys_mask, x.unsqueeze(0), cache=state, lid_post=lid_post
         )
         return logp.squeeze(0), state
 
     def batch_score(
-        self, ys: torch.Tensor, states: List[Any], xs: torch.Tensor
+        self, ys: torch.Tensor, states: List[Any], xs: torch.Tensor, lid_post: torch.Tensor
     ) -> Tuple[torch.Tensor, List[Any]]:
         """Score new token batch.
-
         Args:
             ys (torch.Tensor): torch.int64 prefix tokens (n_batch, ylen).
             states (List[Any]): Scorer states for prefix tokens.
             xs (torch.Tensor):
                 The encoder feature that generates ys (n_batch, xlen, n_feat).
-
         Returns:
             tuple[torch.Tensor, List[Any]]: Tuple of
                 batchfied scores for next token with shape of `(n_batch, n_vocab)`
                 and next state list for ys.
-
         """
         # merge states
         n_batch = len(ys)
@@ -238,7 +207,7 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
 
         # batch decoding
         ys_mask = subsequent_mask(ys.size(-1), device=xs.device).unsqueeze(0)
-        logp, states = self.forward_one_step(ys, ys_mask, xs, cache=batch_state)
+        logp, states = self.forward_one_step(ys, ys_mask, xs, cache=batch_state, lid_post=lid_post)
 
         # transpose state of [layer, batch] into [batch, layer]
         state_list = [[states[i][b] for i in range(n_layers)] for b in range(n_batch)]
@@ -294,21 +263,3 @@ class TransformerDecoder(BaseTransformerDecoder):
                 concat_after,
             ),
         )
-        self.lid_decoders = repeat(
-            num_blocks,
-            lambda lnum: DecoderLayer(
-                attention_dim,
-                MultiHeadedAttention(
-                    attention_heads, attention_dim, self_attention_dropout_rate
-                ),
-                MultiHeadedAttention(
-                    attention_heads, attention_dim, src_attention_dropout_rate
-                ),
-                PositionwiseFeedForward(attention_dim, linear_units, dropout_rate),
-                dropout_rate,
-                normalize_before,
-                concat_after,
-            ),
-        )
-
-

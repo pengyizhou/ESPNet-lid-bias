@@ -314,8 +314,9 @@ class BeamSearch(torch.nn.Module):
             weighted_scores = torch.zeros(self.n_vocab, dtype=x.dtype, device=x.device)
             scores, states, lid_decisions = self.score_full(hyp, x)
             # ipdb.set_trace()
+            
             for k in self.full_scorers:
-                if k == "lm":
+                if k == "decoder":
                     # self.eng_sw_id
                     # ipdb.set_trace()
                     new_score = scores[k]
