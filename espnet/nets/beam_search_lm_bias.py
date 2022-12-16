@@ -169,11 +169,11 @@ class BeamSearch(torch.nn.Module):
         states = dict()
         # lid_decisions = 
         for k, d in self.full_scorers.items():
-            if k == "decoder":
+            if k == "lm":
                 # logging.info("Using full scorer: decoder")
                 scores[k], states[k], lid_decisions = d.score(hyp.yseq, hyp.states[k], x)
                 # logging.info(len(hyp.yseq), lid_decisions.items())
-            elif k == "lm":
+            elif k == "decoder":
                 scores[k], states[k] = d.score(hyp.yseq, hyp.states[k], x)
             else:
                 scores[k], states[k] = d.score(hyp.yseq, hyp.states[k], x)
@@ -320,7 +320,7 @@ class BeamSearch(torch.nn.Module):
                     # self.eng_sw_id
                     # ipdb.set_trace()
                     new_score = scores[k]
-                    new_score[3:self.eng_sw_id - 1] = self.weights[k] * (scores[k][3:self.eng_sw_id - 1] + lid_decisions[1])  # Mandarin
+                    new_score[2:self.eng_sw_id - 1] = self.weights[k] * (scores[k][2:self.eng_sw_id - 1] + lid_decisions[1])  # Mandarin
                     new_score[self.eng_sw_id - 1:-1] = self.weights[k] * (scores[k][self.eng_sw_id - 1:-1] + lid_decisions[0])# English
                     # new_score[-1] = self.weights[k] * scores[k][-1] * 0.5 # eos
                     new_score[-1] = self.weights[k] * (scores[k][-1] + lid_decisions[-1])

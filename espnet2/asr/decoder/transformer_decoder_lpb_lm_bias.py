@@ -23,7 +23,7 @@ from espnet.nets.pytorch_backend.transformer.positionwise_feed_forward import (
 )
 from espnet.nets.pytorch_backend.transformer.repeat import repeat
 from espnet.nets.scorer_interface import BatchScorerInterface
-import ipdb
+
 
 class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
     """Base class of Transfomer decoder module.
@@ -139,7 +139,8 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         x_lid = self.after_norm_lid(x_lid)
         x_lid = self.output_lid_layer(x_lid)
         lid_post = torch.nn.functional.softmax(x_lid, dim=-1)
-        
+
+
         sos_lid = torch.zeros((lid_post.size(0),1 , self.lid_vocab_size))
         sos_lid[:,:,-1] = 1.0
         sos_lid = sos_lid.type_as(lid_post)
@@ -187,13 +188,15 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
 
         x_lid = self.after_norm_lid(x_lid)
         x_lid = self.output_lid_layer(x_lid)
+        lid_decision = torch.log_softmax(x_lid[0][-1], dim=-1)
         lid_post = torch.nn.functional.softmax(x_lid, dim=-1)
-        ipdb.set_trace()
+        
         sos_lid = torch.zeros((lid_post.size(0),1 , self.lid_vocab_size))
         sos_lid[:,:,-1] = 1.0
         sos_lid = sos_lid.type_as(lid_post)
         lid_post = torch.cat((sos_lid, lid_post[:,:-1,:]),dim=1)
-
+        
+        
         x = self.embed(tgt)
         x = torch.cat((lid_post, x), dim=-1)
         x = self.pos_proj(x)
@@ -209,15 +212,15 @@ class BaseTransformerDecoder(AbsDecoder, BatchScorerInterface):
         y = self.after_norm(x[:, -1])
         y = torch.log_softmax(self.output_layer(y), dim=-1)
 
-        return y, new_cache
+        return y, new_cache, lid_decision
 
     def score(self, ys, state, x, lid_post):
         """Score."""
         ys_mask = subsequent_mask(len(ys), device=x.device).unsqueeze(0)
-        logp, state = self.forward_one_step(
+        logp, state, lid_decision = self.forward_one_step(
             ys.unsqueeze(0), ys_mask, x.unsqueeze(0), cache=state
         )
-        return logp.squeeze(0), state
+        return logp.squeeze(0), state, lid_decision
 
     def batch_score(
         self, ys: torch.Tensor, states: List[Any], xs: torch.Tensor

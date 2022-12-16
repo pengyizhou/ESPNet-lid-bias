@@ -175,7 +175,7 @@ class CommonPreprocessor(AbsPreprocessor):
 
             self.token_id_converter_lid = TokenIDConverter(
                 token_list=token_lid_list,
-                unk_symbol=unk_symbol,
+                unk_symbol="e",
             )
         else:
             self.text_cleaner = None
